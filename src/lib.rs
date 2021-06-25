@@ -1,8 +1,6 @@
 use memflow::prelude::*;
 use std::convert::TryInto;
 
-use goblin::Object;
-
 use memflow::architecture::x86::x64;
 
 struct KernelInfo {
@@ -25,57 +23,17 @@ fn read_val_relat<T: dataview::Pod>(
     mem.phys_read((off + reloff + buf_off).into())
 }
 
-fn check_va(mem: &mut impl VirtualMemory, addr: Address) -> Result<Address> {
-    let mut buf = vec![0; size::mb(2)];
-
-    mem.virt_read_raw_into(addr, &mut buf).data_part()?;
-
-    buf.chunks_exact(x64::ARCH.page_size())
-        .enumerate()
-        .filter_map(|(i, c)| {
-            if let Ok(Object::Elf(elf)) = Object::parse(c) {
-                Some((i, c, elf))
-            } else {
-                None
-            }
-        })
-        .map(|(i, b, c)| (addr + i * x64::ARCH.page_size(), b, c))
-        .inspect(|(a, _, obj)| println!("{:x} {:?}", a, obj))
-        .map(|(a, _, _)| a)
-        .last()
-        .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
-}
-
-pub fn find_kernel_base(mut mem: impl PhysicalMemory, cr3: Address) -> Result<Address> {
+pub fn find_kernel_base(
+    mem: impl PhysicalMemory,
+    cr3: Address,
+    text_base: Address,
+) -> Result<Address> {
     let x64_translator = x64::new_translator(cr3);
-
-    // This not
-    let val = x64_translator.virt_to_phys(&mut mem, 0xffffffff8d000000u64.into());
-
-    println!("TR {:?}", &val);
-
-    println!("{:x}", val.unwrap_or_default());
-
-    println!("DMA");
 
     let mut mem = VirtualDma::new(mem, x64::ARCH, x64_translator);
 
-    let page_map = mem.virt_page_map(size::mb(2));
-
-    for &(addr, size) in page_map.iter() {
-        println!("{:x}-{:x}", addr, addr + size);
-    }
-
-    match page_map
-        .into_iter()
-        .flat_map(|(va, size)| size.page_chunks(va, size::mb(2)))
-        .filter(|&(_, size)| size > size::kb(256))
-        .filter_map(|(va, _)| check_va(&mut mem, va).ok())
-        .next()
-    {
-        Some(a) => Ok(a),
-        None => Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound)),
-    }
+    mem.phys_to_virt(text_base)
+        .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
 }
 
 fn str_to_byte_iter<'a>(s: &'a str) -> impl 'a + Iterator<Item = u8> {
@@ -116,10 +74,19 @@ fn strs_to_sig(s: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
     (bytes, mask, deref_pos)
 }
 
-pub fn find_kernel(mut mem: impl PhysicalMemory, upper_hint: Option<Address>) -> Result<Address> {
+pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<(Address, Address)> {
     let metadata = mem.metadata();
 
-    let mut buf = vec![0; size::mb(256)];
+    let mut buf = vec![0; size::mb(2)];
+
+    let page_size = size::kb(4);
+    let page_align = size::mb(2);
+    let buf_range = buf.len() * page_align / page_size;
+
+    let mut read_data = buf
+        .chunks_mut(page_size)
+        .map(|chunk| PhysicalReadData(PhysicalAddress::INVALID, chunk.into()))
+        .collect::<Vec<_>>();
 
     // https://elixir.bootlin.com/linux/v5.9.16/source/arch/x86/kernel/head_64.S#L112
 
@@ -155,20 +122,24 @@ pub fn find_kernel(mut mem: impl PhysicalMemory, upper_hint: Option<Address>) ->
 
     let (cr3_off, la57_reloff, phys_base_reloff) = (deref_pos[0], deref_pos[1], deref_pos[2]);
 
-    for addr in (0..upper_hint.map(|x| x.as_usize()).unwrap_or(metadata.size))
-        .step_by(buf.len())
-        .rev()
-        .map(Address::from)
-    {
-        buf.iter_mut().for_each(|i| *i = 0);
-        mem.phys_read_raw_into(addr.into(), buf.as_mut_slice())?;
+    for addr in (0..metadata.size).step_by(buf_range).map(Address::from) {
+        for (i, PhysicalReadData(paddr, buf)) in read_data.iter_mut().enumerate() {
+            *paddr = Address::from(addr + i * page_align).into();
+            buf.iter_mut().for_each(|i| *i = 0);
+        }
+
+        mem.phys_read_raw_list(read_data.as_mut_slice())?;
 
         println!("READ {:x}", addr);
 
-        for (addr, num) in buf
-            .windows(bytes.len())
-            .enumerate()
-            .map(|(off, w)| (addr + off, w))
+        for (addr, num) in read_data
+            .iter()
+            .flat_map(|PhysicalReadData(paddr, buf)| {
+                let addr = paddr.address();
+                buf.windows(bytes.len())
+                    .enumerate()
+                    .map(move |(off, w)| (addr + off, w))
+            })
             .filter(|(_, w)| {
                 w.iter()
                     .zip(&mask)
@@ -186,12 +157,14 @@ pub fn find_kernel(mut mem: impl PhysicalMemory, upper_hint: Option<Address>) ->
             let la57 = read_val_relat(&mut mem, num, la57_reloff, addr + 8).unwrap_or(0) & 1;
             let phys_base = read_val_relat(&mut mem, num, phys_base_reloff, addr + 4).unwrap_or(0);
             let cr3 = phys_base + cr3_off as u64;
+            let text_base = addr.as_page_aligned(size::mb(2));
 
             if cr3 != phys_base && cr3 < metadata.size as u64 {
                 println!("phys_base: {:x}", phys_base);
                 println!("CR3: {:x}", cr3);
                 println!("LA57 ON: {:x}", la57);
-                return find_kernel_base(mem, cr3.into());
+                println!("phys text: {:x}", text_base);
+                return find_kernel_base(mem, cr3.into(), text_base).map(|b| (cr3.into(), b));
             }
         }
     }
