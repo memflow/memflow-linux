@@ -6,12 +6,10 @@ edition = "2018"
 
 [dependencies]
 memflow = { git = "https://github.com/memflow/memflow.git", branch = "next" }
-#reflow = { git = "https://github.com/memflow/reflow.git" }
-reflow = { path = "../reflow" }
-#memflow = { path = "../memflow3/memflow/memflow" }
 log = "0.4"
 dataview = "0.1.1"
 goblin = "0.3"
+iced-x86 = "1.12"
 
 [dev_dependencies]
 simple_logger = "1.6"

@@ -1,7 +1,6 @@
 use memflow::architecture::x86::*;
 use memflow::prelude::*;
-use memflow_linux::find_kernel;
-use reflow::prelude::v1::*;
+use memflow_linux::{find_kernel, KernelInfo};
 
 fn main() -> Result<()> {
     simple_logger::SimpleLogger::new()
@@ -13,27 +12,36 @@ fn main() -> Result<()> {
 
     let mut connector = inventory.create_connector("kcore", None, &Args::default())?;
 
-    let (cr3, text) = find_kernel(connector.forward_mut())?;
+    let KernelInfo {
+        cr3,
+        virt_text,
+        kallsyms,
+        ..
+    } = find_kernel(connector.forward_mut())?;
 
-    println!("Kernel virt text: {:x}", text);
+    let connector = CachedMemoryAccess::builder(connector)
+        .arch(x64::ARCH)
+        .build()?;
+
+    println!("Kernel virt text: {:x}", virt_text);
 
     let x64_translator = x64::new_translator(cr3);
 
-    let mem = VirtualDma::new(connector, x64::ARCH, x64_translator);
+    let vat = DirectTranslate::new();
 
-    let mut oven = Oven::new_with_arch(mem, ArchitectureIdent::X86(64, false))
-        .stack(Stack::new().ret_addr(0xDEADBEEFu64))
-        .params(Parameters::new().reg_str(RegisterX86::RDI, "kallsyms_lookup_name"))
-        .entry_point(Address::from(0xffffffffb118c080u64));
+    let vat = CachedVirtualTranslate::builder(vat)
+        .arch(x64::ARCH)
+        .build()?;
+
+    let mut mem = VirtualDma::with_vat(connector, x64::ARCH, x64_translator, vat);
+
+    println!("num syms: {}", kallsyms.num_syms());
 
     let time = std::time::Instant::now();
 
-    let result = oven.reflow().unwrap();
-
-    println!(
-        "result: {:x}",
-        result.reg_read_u64(RegisterX86::RAX).unwrap()
-    );
+    for (addr, name) in kallsyms.syms_iter(&mut mem) {
+        println!("{:016x} {}", addr.as_u64(), name);
+    }
 
     println!("Elapsed: {}", time.elapsed().as_secs_f32());
 

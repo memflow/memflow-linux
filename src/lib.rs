@@ -3,9 +3,310 @@ use std::convert::TryInto;
 
 use memflow::architecture::x86::x64;
 
-struct KernelInfo {
+use iced_x86::*;
+
+pub mod kallsyms;
+use kallsyms::KallsymsInfo;
+
+#[derive(Clone, Copy)]
+pub struct KernelInfo {
+    pub cr3: Address,
+    pub phys_base: Address,
+    pub la57_on: bool,
+    pub virt_text: Address,
+    pub phys_text: Address,
+    pub kallsyms: KallsymsInfo,
+}
+
+fn find_kallsyms(
+    mem: &mut impl PhysicalMemory,
     cr3: Address,
-    la57_on: bool,
+    virt_text: Address,
+) -> Result<KallsymsInfo> {
+    let mut buf = vec![0; size::mb(2)];
+
+    let x64_translator = x64::new_translator(cr3);
+
+    let mut mem = VirtualDma::new(mem.forward(), x64::ARCH, x64_translator);
+
+    mem.virt_read_raw_into(virt_text, &mut buf)?;
+
+    let kallsyms_lookup = find_kallsyms_lookup(&mut mem, &buf, virt_text)?;
+
+    println!("kallsyms_lookup: {:x}", kallsyms_lookup);
+
+    let (kallsyms_expand_symbol, _) = find_kallsyms_expand_symbol(
+        &mut mem,
+        &buf[(kallsyms_lookup - virt_text)..],
+        kallsyms_lookup,
+    )?;
+
+    println!("kallsyms_expand_symbol: {:x}", kallsyms_expand_symbol);
+
+    let (kallsyms_names, token_index, token_table) =
+        parse_expand_symbol(kallsyms_expand_symbol, &mut mem, &mut buf[0..size::kb(4)])?;
+
+    let kallsyms = KallsymsInfo::new(
+        kallsyms_expand_symbol,
+        kallsyms_names,
+        token_table,
+        token_index,
+        8,
+        &mut mem,
+    )?;
+
+    println!("{:#?}", kallsyms);
+
+    Ok(kallsyms)
+
+    /*kallsyms.expand_symbol = kallsyms_expand_symbol;
+
+    kallsyms = parse_expand_symbol(kallsyms, &mut mem, &mut buf[0..size::kb(4)])?;
+
+    // -alignment, which is 8 in x64
+    kallsyms.num_syms = kallsyms.names - 8;
+
+    Ok(kallsyms)*/
+}
+
+fn find_kallsyms_lookup(
+    mem: &mut impl VirtualMemory,
+    buf: &[u8],
+    virt_text: Address,
+) -> Result<Address> {
+    let mut prev_call = None;
+
+    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+
+    decoder.set_ip(virt_text.as_u64());
+
+    // Walk down the buffer and find a function that contains target format string.
+    for instr in decoder.into_iter() {
+        if instr.is_call_near() && prev_call.is_none() {
+            // Save the first call instruction in the function, that's where kallsyms_lookup should be.
+            prev_call = Some(Address::from(instr.near_branch_target()));
+        } else if instr.mnemonic() == Mnemonic::Push && instr.op0_register() == Register::R14 {
+            // Reset the prev_call if we reach push of R14, basically start of the function.
+            prev_call = None;
+        } else if instr.mnemonic() == Mnemonic::Mov {
+            // The target string is inside an immediate32to64 value.
+            if let Ok(OpKind::Immediate32to64) = instr.try_op_kind(1) {
+                let target = Address::from(instr.immediate32to64() as u64);
+                let target_str = "+%#lx/%#lx";
+                if let Ok(read_str) = mem.virt_read_char_array(target, target_str.len() + 1) {
+                    if read_str.starts_with(target_str) {
+                        return Ok(prev_call.unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
+}
+
+fn is_kallsyms_expand_symbol(mem: &mut impl VirtualMemory, address: Address) -> Result<Address> {
+    let mut buf = vec![0; size::kb(4)];
+
+    mem.virt_read_raw_into(address, &mut buf).data_part()?;
+
+    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+
+    decoder.set_ip(address.as_u64());
+
+    let mut formatter = NasmFormatter::new();
+
+    // Change some options, there are many more
+    formatter.options_mut().set_first_operand_char_index(10);
+    formatter.options_mut().set_uppercase_all(false);
+    formatter.options_mut().set_uppercase_hex(false);
+
+    let mut output = String::new();
+
+    println!("Disasm {:x}", address);
+
+    let mut prev_displacement = 0;
+
+    for instr in decoder.into_iter() {
+        output.clear();
+        formatter.format(&instr, &mut output);
+
+        println!("{:x}: {}", instr.ip(), output);
+
+        // The unique signature are 2 moves that have the same address,
+        // followed by another move that is one higher from the previous one.
+        // Match both of them.
+        if instr.memory_base() == Register::RAX {
+            let displacement = instr.memory_displacement64();
+            if displacement != 0
+                && (displacement == prev_displacement
+                    || displacement == prev_displacement.saturating_add(1))
+            {
+                return Ok(prev_displacement.into());
+            }
+            prev_displacement = displacement;
+        }
+
+        if instr.mnemonic() == Mnemonic::Ret {
+            break;
+        }
+
+        // kallsyms_expand_symbol has no branches before the unique signature
+        if instr.near_branch_target() != 0 {
+            break;
+        }
+    }
+
+    Err(ErrorOrigin::OsLayer.into())
+}
+
+fn find_kallsyms_expand_symbol(
+    mem: &mut impl VirtualMemory,
+    buf: &[u8],
+    kallsyms_lookup: Address,
+) -> Result<(Address, Address)> {
+    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+
+    decoder.set_ip(kallsyms_lookup.as_u64());
+
+    let mut furthest_jump = 0;
+
+    for instr in decoder.into_iter() {
+        if instr.mnemonic() == Mnemonic::Ret && instr.ip() >= furthest_jump {
+            break;
+        }
+
+        if instr.is_call_near() {
+            if let Ok(addr) = is_kallsyms_expand_symbol(mem, instr.near_branch_target().into()) {
+                return Ok((instr.near_branch_target().into(), addr));
+            }
+        } else if instr.near_branch_target() > instr.ip() && instr.mnemonic() != Mnemonic::Jmp {
+            furthest_jump = std::cmp::max(furthest_jump, instr.near_branch_target());
+        } else if instr.mnemonic() == Mnemonic::Jmp {
+            break;
+        }
+    }
+
+    Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
+}
+
+fn parse_expand_symbol(
+    expand_symbol: Address,
+    mem: &mut impl VirtualMemory,
+    buf: &mut [u8],
+) -> Result<(Address, Address, Address)> {
+    mem.virt_read_raw_into(expand_symbol, buf)?;
+
+    let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
+
+    decoder.set_ip(expand_symbol.as_u64());
+
+    let mut formatter = NasmFormatter::new();
+
+    // Change some options, there are many more
+    formatter.options_mut().set_first_operand_char_index(10);
+    formatter.options_mut().set_uppercase_all(false);
+    formatter.options_mut().set_uppercase_hex(false);
+
+    let mut output = String::new();
+
+    let mut prev_displacement = Address::null();
+
+    // First phase, extract the `kallsyms_names` variable
+    let names = loop {
+        if !decoder.can_decode() {
+            break None;
+        }
+
+        let instr = decoder.decode();
+        output.clear();
+        formatter.format(&instr, &mut output);
+
+        println!("{:x}: {}", instr.ip(), output);
+
+        // The unique signature are 2 moves that have the same address,
+        // followed by another move that is one higher from the previous one.
+        // Match both of them.
+        if instr.memory_base() == Register::RAX {
+            let displacement = instr.memory_displacement64().into();
+            if displacement != Address::NULL
+                && (displacement == prev_displacement || displacement == prev_displacement + 1)
+            {
+                break Some(displacement);
+            }
+            prev_displacement = displacement;
+        }
+
+        if instr.mnemonic() == Mnemonic::Ret {
+            break None;
+        }
+
+        // kallsyms_expand_symbol has no branches before the unique signature
+        if instr.near_branch_target() != 0 {
+            break None;
+        }
+    }
+    .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
+
+    println!("Found names: {}", names);
+
+    // Second phase, find the token index table.
+    let token_index = loop {
+        if !decoder.can_decode() {
+            break None;
+        }
+
+        let instr = decoder.decode();
+        output.clear();
+        formatter.format(&instr, &mut output);
+
+        println!("{:x}: {}", instr.ip(), output);
+
+        if instr.memory_base() == Register::RAX {
+            let displacement: Address = instr.memory_displacement64().into();
+            if (displacement.as_u64() as i64) < 0
+                && (displacement != prev_displacement && displacement != prev_displacement + 1)
+            {
+                break Some(displacement);
+            }
+            prev_displacement = displacement;
+        }
+
+        if instr.mnemonic() == Mnemonic::Ret {
+            break None;
+        }
+    }
+    .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
+
+    println!("Found token index: {}", token_index);
+
+    let token_table = loop {
+        if !decoder.can_decode() {
+            break None;
+        }
+
+        let instr = decoder.decode();
+        output.clear();
+        formatter.format(&instr, &mut output);
+
+        println!("{:x}: {}", instr.ip(), output);
+
+        // This usually is in RDX register, but that could be different on other compilers
+        let displacement: Address = instr.memory_displacement64().into();
+        if (displacement.as_u64() as i64) < 0 && displacement != prev_displacement {
+            break Some(displacement);
+        }
+        prev_displacement = displacement;
+
+        if instr.mnemonic() == Mnemonic::Ret {
+            break None;
+        }
+    }
+    .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
+
+    println!("Found token table: {}", token_table);
+
+    Ok((names, token_index, token_table))
 }
 
 fn read_val_at(buf: &[u8], buf_off: usize) -> u32 {
@@ -24,13 +325,13 @@ fn read_val_relat<T: dataview::Pod>(
 }
 
 pub fn find_kernel_base(
-    mem: impl PhysicalMemory,
+    mem: &mut impl PhysicalMemory,
     cr3: Address,
     text_base: Address,
 ) -> Result<Address> {
     let x64_translator = x64::new_translator(cr3);
 
-    let mut mem = VirtualDma::new(mem, x64::ARCH, x64_translator);
+    let mut mem = VirtualDma::new(mem.forward(), x64::ARCH, x64_translator);
 
     mem.phys_to_virt(text_base)
         .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
@@ -74,7 +375,7 @@ fn strs_to_sig(s: &[&str]) -> (Vec<u8>, Vec<u8>, Vec<usize>) {
     (bytes, mask, deref_pos)
 }
 
-pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<(Address, Address)> {
+pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     let metadata = mem.metadata();
 
     let mut buf = vec![0; size::mb(2)];
@@ -164,7 +465,19 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<(Address, Address)> {
                 println!("CR3: {:x}", cr3);
                 println!("LA57 ON: {:x}", la57);
                 println!("phys text: {:x}", text_base);
-                return find_kernel_base(mem, cr3.into(), text_base).map(|b| (cr3.into(), b));
+
+                let virt_text = find_kernel_base(&mut mem, cr3.into(), text_base)?;
+
+                let kallsyms = find_kallsyms(&mut mem, cr3.into(), virt_text)?;
+
+                return Ok(KernelInfo {
+                    cr3: cr3.into(),
+                    la57_on: la57 != 0,
+                    phys_base: phys_base.into(),
+                    phys_text: text_base,
+                    virt_text,
+                    kallsyms,
+                });
             }
         }
     }
