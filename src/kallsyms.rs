@@ -123,7 +123,7 @@ impl<'a, T: VirtualMemory> KallsymsIterator<'a, T> {
     }
 
     pub fn next_allocfree(&mut self, out_name: &mut String) -> Option<Address> {
-        if self.kallsyms.names + self.cur_name_off >= self.kallsyms.markers {
+        if self.cur_idx >= self.kallsyms.num_syms {
             return None;
         }
 
@@ -146,7 +146,7 @@ impl<'a, T: VirtualMemory> Iterator for KallsymsIterator<'a, T> {
     type Item = (Address, String);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.kallsyms.names + self.cur_name_off >= self.kallsyms.markers {
+        if self.cur_idx >= self.kallsyms.num_syms {
             return None;
         }
 

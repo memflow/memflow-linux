@@ -1,6 +1,6 @@
 use memflow::architecture::x86::*;
 use memflow::prelude::*;
-use memflow_linux::{find_kernel, KernelInfo};
+use memflow_linux::kernel::x64::{find_kernel, KernelInfo};
 
 fn main() -> Result<()> {
     simple_logger::SimpleLogger::new()
