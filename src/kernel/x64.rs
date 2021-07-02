@@ -10,6 +10,8 @@ use iced_x86::*;
 
 use std::ops::RangeInclusive;
 
+use log::*;
+
 #[derive(Clone, Copy)]
 pub struct KernelInfo {
     pub cr3: Address,
@@ -119,7 +121,7 @@ fn find_kallsyms(
 
     let kallsyms_lookup = find_kallsyms_lookup(&mut mem, &buf, virt_text)?;
 
-    println!("kallsyms_lookup: {:x}", kallsyms_lookup);
+    debug!("kallsyms_lookup: {:x}", kallsyms_lookup);
 
     let (kallsyms_expand_symbol, _) = find_kallsyms_expand_symbol(
         &mut mem,
@@ -127,7 +129,7 @@ fn find_kallsyms(
         kallsyms_lookup,
     )?;
 
-    println!("kallsyms_expand_symbol: {:x}", kallsyms_expand_symbol);
+    debug!("kallsyms_expand_symbol: {:x}", kallsyms_expand_symbol);
 
     let (kallsyms_names, token_index, token_table) =
         parse_expand_symbol(kallsyms_expand_symbol, &mut mem, &mut buf[0..size::kb(4)])?;
@@ -141,18 +143,9 @@ fn find_kallsyms(
         &mut mem,
     )?;
 
-    println!("{:#?}", kallsyms);
+    debug!("{:#?}", kallsyms);
 
     Ok(kallsyms)
-
-    /*kallsyms.expand_symbol = kallsyms_expand_symbol;
-
-    kallsyms = parse_expand_symbol(kallsyms, &mut mem, &mut buf[0..size::kb(4)])?;
-
-    // -alignment, which is 8 in x64
-    kallsyms.num_syms = kallsyms.names - 8;
-
-    Ok(kallsyms)*/
 }
 
 fn find_kallsyms_lookup(
@@ -209,7 +202,7 @@ fn is_kallsyms_expand_symbol(mem: &mut impl VirtualMemory, address: Address) -> 
 
     let mut output = String::new();
 
-    println!("Disasm {:x}", address);
+    debug!("Disasm {:x}", address);
 
     let mut prev_displacement = 0;
 
@@ -217,7 +210,7 @@ fn is_kallsyms_expand_symbol(mem: &mut impl VirtualMemory, address: Address) -> 
         output.clear();
         formatter.format(&instr, &mut output);
 
-        println!("{:x}: {}", instr.ip(), output);
+        trace!("{:x}: {}", instr.ip(), output);
 
         // The unique signature are 2 moves that have the same address,
         // followed by another move that is one higher from the previous one.
@@ -308,7 +301,7 @@ fn parse_expand_symbol(
         output.clear();
         formatter.format(&instr, &mut output);
 
-        println!("{:x}: {}", instr.ip(), output);
+        trace!("{:x}: {}", instr.ip(), output);
 
         // The unique signature are 2 moves that have the same address,
         // followed by another move that is one higher from the previous one.
@@ -334,7 +327,7 @@ fn parse_expand_symbol(
     }
     .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
 
-    println!("Found names: {}", names);
+    debug!("Found names: {}", names);
 
     // Second phase, find the token index table.
     let token_index = loop {
@@ -346,7 +339,7 @@ fn parse_expand_symbol(
         output.clear();
         formatter.format(&instr, &mut output);
 
-        println!("{:x}: {}", instr.ip(), output);
+        trace!("{:x}: {}", instr.ip(), output);
 
         if instr.memory_base() != Register::RIP {
             //== Register::RAX {
@@ -366,7 +359,7 @@ fn parse_expand_symbol(
     }
     .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
 
-    println!("Found token index: {}", token_index);
+    debug!("Found token index: {}", token_index);
 
     let token_table = loop {
         if !decoder.can_decode() {
@@ -377,7 +370,7 @@ fn parse_expand_symbol(
         output.clear();
         formatter.format(&instr, &mut output);
 
-        println!("{:x}: {}", instr.ip(), output);
+        debug!("{:x}: {}", instr.ip(), output);
 
         // This usually is in RDX register, but that could be different on other compilers
         let displacement: Address = instr.memory_displacement64().into();
@@ -395,7 +388,7 @@ fn parse_expand_symbol(
     }
     .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))?;
 
-    println!("Found token table: {}", token_table);
+    debug!("Found token table: {}", token_table);
 
     Ok((names, token_index, token_table))
 }
@@ -700,7 +693,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
 
         mem.phys_read_raw_list(read_data.as_mut_slice())?;
 
-        println!("READ {:x}", addr);
+        trace!("read {:x}", addr);
 
         for (addr, num, (version, config_la57, sig)) in
             sigs.iter().flat_map(|(version, la57, sig)| {
@@ -728,7 +721,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             for b in num {
                 st += &format!("{:02x} ", b);
             }
-            println!("MATCH FOUND {:?} {:x} {}", st, addr, version);
+            trace!("match found {:?} {:x} {}", st, addr, version);
 
             let cr3_off = read_val_at(num, cr3_off) as usize;
             let la57 = if let Some(la57_reloff) = la57_reloff {
@@ -741,12 +734,12 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             let text_base = addr.as_page_aligned(size::mb(2));
 
             if cr3 != phys_base && cr3 < metadata.size as u64 {
-                println!("Version range: {}", version);
+                info!("Version range: {}", version);
 
-                println!("phys_base: {:x}", phys_base);
-                println!("CR3: {:x}", cr3);
-                println!("LA57 ON: {:x}", la57);
-                println!("phys text: {:x}", text_base);
+                info!("phys_base: {:x}", phys_base);
+                info!("CR3: {:x}", cr3);
+                info!("LA57 ON: {:x}", la57);
+                info!("phys text: {:x}", text_base);
 
                 let virt_text = find_kernel_base(&mut mem, cr3.into(), text_base)?;
 

@@ -13,3 +13,4 @@ iced-x86 = "1.12"
 
 [dev_dependencies]
 simple_logger = "1.6"
+clap = "2"
