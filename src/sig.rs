@@ -1,11 +1,20 @@
 fn str_to_byte_iter<'a>(s: &'a str) -> impl 'a + Iterator<Item = u8> {
     s.split_whitespace()
-        .map(|b| u8::from_str_radix(b, 16).unwrap_or(0))
+        .map(|b| b.trim_start_matches('*'))
+        .map(|b| u8::from_str_radix(&b.replace('?', "0"), 16).unwrap_or(0))
 }
 
 fn str_to_mask_iter<'a>(s: &'a str) -> impl 'a + Iterator<Item = u8> {
+    const Q: u8 = '?' as u8;
     s.split_whitespace()
-        .map(|b| if b.contains("?") { 0 } else { 0xff })
+        .map(|b| b.trim_start_matches('*'))
+        .map(|b| match b.as_bytes() {
+            // If just a single or two questionmarks, return 0, else, mask based on order
+            [Q] | [Q, Q] => 0,
+            [Q, _] => 0x0f,
+            [_, Q] => 0xf0,
+            _ => 0xff,
+        })
 }
 
 fn str_to_deref_pos_iter<'a>(s: &'a str, off: usize) -> (usize, impl 'a + Iterator<Item = usize>) {

@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 
 use log::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct KernelInfo {
     pub cr3: Address,
     pub phys_base: Address,
@@ -20,6 +20,7 @@ pub struct KernelInfo {
     pub virt_text: Address,
     pub phys_text: Address,
     pub kallsyms: KallsymsInfo,
+    pub version: VersionRange,
 }
 
 #[derive(Clone)]
@@ -117,7 +118,7 @@ fn find_kallsyms(
 
     let mut mem = VirtualDma::new(mem.forward(), x64::ARCH, x64_translator);
 
-    mem.virt_read_raw_into(virt_text, &mut buf)?;
+    mem.read_raw_into(virt_text, &mut buf)?;
 
     let kallsyms_lookup = find_kallsyms_lookup(&mut mem, &buf, virt_text)?;
 
@@ -125,7 +126,7 @@ fn find_kallsyms(
 
     let (kallsyms_expand_symbol, _) = find_kallsyms_expand_symbol(
         &mut mem,
-        &buf[(kallsyms_lookup - virt_text)..],
+        &buf[(kallsyms_lookup - virt_text) as usize..],
         kallsyms_lookup,
     )?;
 
@@ -149,7 +150,7 @@ fn find_kallsyms(
 }
 
 fn find_kallsyms_lookup(
-    mem: &mut impl VirtualMemory,
+    mem: &mut impl MemoryView,
     buf: &[u8],
     virt_text: Address,
 ) -> Result<Address> {
@@ -157,7 +158,7 @@ fn find_kallsyms_lookup(
 
     let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
 
-    decoder.set_ip(virt_text.as_u64());
+    decoder.set_ip(virt_text.to_umem());
 
     // Walk down the buffer and find a function that contains target format string.
     for instr in decoder.into_iter() {
@@ -172,7 +173,7 @@ fn find_kallsyms_lookup(
             if let Ok(OpKind::Immediate32to64) = instr.try_op_kind(1) {
                 let target = Address::from(instr.immediate32to64() as u64);
                 let target_str = "+%#lx/%#lx";
-                if let Ok(read_str) = mem.virt_read_char_array(target, target_str.len() + 1) {
+                if let Ok(read_str) = mem.read_char_array(target, target_str.len() + 1) {
                     if read_str.starts_with(target_str) {
                         return Ok(prev_call.unwrap());
                     }
@@ -184,14 +185,14 @@ fn find_kallsyms_lookup(
     Err(Error(ErrorOrigin::OsLayer, ErrorKind::NotFound))
 }
 
-fn is_kallsyms_expand_symbol(mem: &mut impl VirtualMemory, address: Address) -> Result<Address> {
+fn is_kallsyms_expand_symbol(mem: &mut impl MemoryView, address: Address) -> Result<Address> {
     let mut buf = vec![0; size::kb(4)];
 
-    mem.virt_read_raw_into(address, &mut buf).data_part()?;
+    mem.read_raw_into(address, &mut buf).data_part()?;
 
     let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
 
-    decoder.set_ip(address.as_u64());
+    decoder.set_ip(address.to_umem());
 
     let mut formatter = NasmFormatter::new();
 
@@ -240,13 +241,13 @@ fn is_kallsyms_expand_symbol(mem: &mut impl VirtualMemory, address: Address) -> 
 }
 
 fn find_kallsyms_expand_symbol(
-    mem: &mut impl VirtualMemory,
+    mem: &mut impl MemoryView,
     buf: &[u8],
     kallsyms_lookup: Address,
 ) -> Result<(Address, Address)> {
     let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
 
-    decoder.set_ip(kallsyms_lookup.as_u64());
+    decoder.set_ip(kallsyms_lookup.to_umem());
 
     let mut furthest_jump = 0;
 
@@ -271,14 +272,14 @@ fn find_kallsyms_expand_symbol(
 
 fn parse_expand_symbol(
     expand_symbol: Address,
-    mem: &mut impl VirtualMemory,
+    mem: &mut impl MemoryView,
     buf: &mut [u8],
 ) -> Result<(Address, Address, Address)> {
-    mem.virt_read_raw_into(expand_symbol, buf)?;
+    mem.read_raw_into(expand_symbol, buf)?;
 
     let mut decoder = Decoder::new(64, &buf, DecoderOptions::NONE);
 
-    decoder.set_ip(expand_symbol.as_u64());
+    decoder.set_ip(expand_symbol.to_umem());
 
     let mut formatter = NasmFormatter::new();
 
@@ -345,7 +346,7 @@ fn parse_expand_symbol(
             //== Register::RAX {
             let displacement: Address = instr.memory_displacement64().into();
             if displacement > names
-                && displacement - names < size::mb(32)
+                && displacement - names < mem::mb(32) as imem
                 && (displacement != prev_displacement && displacement != prev_displacement + 1)
             {
                 break Some(displacement);
@@ -375,7 +376,7 @@ fn parse_expand_symbol(
         // This usually is in RDX register, but that could be different on other compilers
         let displacement: Address = instr.memory_displacement64().into();
         if displacement > names
-            && displacement - names < size::mb(32)
+            && displacement - names < mem::mb(32) as imem
             && displacement != prev_displacement
         {
             break Some(displacement);
@@ -397,14 +398,14 @@ fn read_val_at(buf: &[u8], buf_off: usize) -> u32 {
     u32::from_le_bytes(buf[buf_off..(buf_off + 4)].try_into().unwrap())
 }
 
-fn read_val_relat<T: dataview::Pod>(
-    mem: &mut impl PhysicalMemory,
+fn read_val_relat<T: memflow::prelude::Pod>(
+    mem: &mut impl MemoryView,
     buf: &[u8],
     buf_off: usize,
     off: Address,
 ) -> Result<T> {
     let reloff = read_val_at(buf, buf_off) as usize;
-    mem.phys_read((off + reloff + buf_off).into())
+    mem.read((off + reloff + buf_off).into()).data_part()
 }
 
 pub fn find_kernel_base(
@@ -431,7 +432,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
 
     let mut read_data = buf
         .chunks_mut(page_size)
-        .map(|chunk| PhysicalReadData(PhysicalAddress::INVALID, chunk.into()))
+        .map(|chunk| CTup2::<Address, CSliceMut<_>>(Address::INVALID, chunk.into()))
         .collect::<Vec<_>>();
 
     // https://elixir.bootlin.com/linux/v5.9.16/source/arch/x86/kernel/head_64.S#L112
@@ -442,6 +443,8 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     let pat_vcpu = "e8 bb 00 00 00";
 
     let pat_vcpu_with_sev = "e8 cb 00 00 00";
+
+    let pat_vcpu_wildcard = "e8 ?b 00 00 00";
 
     // Pre-4.14, there is no call to __startup_secondary_64.
     //
@@ -457,8 +460,15 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     let pat_startup_secondary_64 = "56
         e8 ? ? ? ?
         5e
-        48 05 *? ? ? ?
         ";
+
+    let pat_add_to_form_cr3 = "48 05 *? ? ? ?";
+
+    // Post 5.19, no call to __startup_secondary_64
+    //
+    // Depending on CONFIG_AMD_MEM_ENCRYPT, either move sme_me_mask, or zero into rax
+    let pat_sme_me_mask_to_rax = "48 8b 04 25 ? ? ? ?";
+    let pat_xor_rax = "48 31 c0";
 
     // Enable PAE mode and PGE with multiple operations
     let pat_pae_pge_v2 = "
@@ -468,6 +478,8 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
         ";
 
     // X86_CR4_PAE | X86_CR4_PGE
+    let pat_middle_orl = "81 c9 a0 00 00 00";
+    // X86_CR4_PAE | X86_CR4_PGE using MOV to ECX
     let pat_middle = "b9 a0 00 00 00";
     // X86_CR4_PAE | X86_CR4_PGE
     // but this time uses EAX register
@@ -475,6 +487,13 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
     // X86_CR4_PAE | X86_CR4_PSE
     // Was really used only by 4.4, for some odd reason
     let pat_middle_44 = "b9 30 00 00 00";
+
+    // Post 5.19, deal with MCE
+    let pat_config_mce = "
+        0f 20 e1
+        83 e1 40
+    ";
+    let pat_no_config_mce = "b9 00 00 00 00";
 
     // This test was added in 4.17
     // Needs: CONFIG_X86_5LEVEL
@@ -502,6 +521,15 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
         5e";
 
     let pat_movcr3 = "0f 22 d8";
+
+    // Was added in 5.17
+    let pat_flushtlb = "
+        0f 20 e1
+        48 89 c8
+        48 81 f1 80 00 00 00
+        0f 22 e1
+        0f 22 e0
+    ";
 
     let pat_end = "
         48 c7 c0 ? ? ? ?
@@ -593,6 +621,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             true,
             Signature::new(&[
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_la57_assign,
                 pat_mid_movcr4,
@@ -605,6 +634,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             true,
             Signature::new(&[
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_la57_test,
                 pat_la57_assign,
@@ -618,6 +648,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             false,
             Signature::new(&[
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_mid_movcr4,
                 pat_mid_addphysbase,
@@ -630,6 +661,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             Signature::new(&[
                 pat_vcpu,
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_la57_test,
                 pat_la57_assign,
@@ -644,6 +676,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             Signature::new(&[
                 pat_vcpu,
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_mid_movcr4,
                 pat_mid_addphysbase,
@@ -656,6 +689,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             Signature::new(&[
                 pat_vcpu_with_sev,
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_la57_test,
                 pat_la57_assign,
@@ -672,43 +706,113 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
             Signature::new(&[
                 pat_vcpu_with_sev,
                 pat_startup_secondary_64,
+                pat_add_to_form_cr3,
                 pat_middle,
                 pat_mid_movcr4,
                 pat_mid_addphysbase,
                 pat_sev,
                 pat_movcr3,
+                pat_end,
+            ]),
+        ),
+        // TODO: check if this actually works (patternswise)
+        (
+            VersionRange::from((5, 17..=255)),
+            true,
+            Signature::new(&[
+                pat_vcpu_wildcard,
+                pat_startup_secondary_64,
+                pat_add_to_form_cr3,
+                pat_middle,
+                pat_la57_test,
+                pat_la57_assign,
+                pat_mid_movcr4,
+                pat_mid_addphysbase,
+                pat_sev,
+                pat_movcr3,
+                pat_flushtlb,
+                pat_end,
+            ]),
+        ),
+        (
+            VersionRange::from((5, 17..=255)),
+            false,
+            Signature::new(&[
+                pat_vcpu_wildcard,
+                pat_startup_secondary_64,
+                pat_add_to_form_cr3,
+                pat_middle,
+                pat_mid_movcr4,
+                pat_mid_addphysbase,
+                pat_sev,
+                pat_movcr3,
+                pat_flushtlb,
+                pat_end,
+            ]),
+        ),
+        (
+            VersionRange::from((5, 19..=255)),
+            true,
+            Signature::new(&[
+                pat_vcpu_wildcard,
+                pat_sme_me_mask_to_rax,
+                pat_add_to_form_cr3,
+                pat_config_mce,
+                pat_middle_orl,
+                pat_la57_test,
+                pat_la57_assign,
+                pat_mid_movcr4,
+                pat_mid_addphysbase,
+                pat_sev,
+                pat_movcr3,
+                pat_flushtlb,
+                pat_end,
+            ]),
+        ),
+        (
+            VersionRange::from((5, 19..=255)),
+            false,
+            Signature::new(&[
+                pat_vcpu_wildcard,
+                pat_sme_me_mask_to_rax,
+                pat_add_to_form_cr3,
+                pat_config_mce,
+                pat_middle_orl,
+                pat_mid_movcr4,
+                pat_mid_addphysbase,
+                pat_sev,
+                pat_movcr3,
+                pat_flushtlb,
                 pat_end,
             ]),
         ),
     ];
 
-    for addr in (0usize..metadata.size)
+    for addr in (mem::mb(0)..metadata.max_address.to_umem())
         .step_by(buf_range)
         .map(Address::from)
     {
-        for (i, PhysicalReadData(paddr, buf)) in read_data.iter_mut().enumerate() {
-            *paddr = Address::from(addr + i * page_align).into();
+        for (i, CTup2(paddr, buf)) in read_data.iter_mut().enumerate() {
+            *paddr = Address::from(addr + i as umem * page_align as umem).into();
             buf.iter_mut().for_each(|i| *i = 0);
         }
 
-        mem.phys_read_raw_list(read_data.as_mut_slice())?;
+        mem.phys_view()
+            .read_raw_list(read_data.as_mut_slice())
+            .data_part()?;
 
         trace!("read {:x}", addr);
 
         for (addr, num, (version, config_la57, sig)) in
             sigs.iter().flat_map(|(version, la57, sig)| {
                 let sig_len = sig.len();
-                read_data
-                    .iter()
-                    .flat_map(move |PhysicalReadData(paddr, buf)| {
-                        let addr = paddr.address();
-
-                        buf.windows(sig_len)
-                            .enumerate()
-                            .map(move |(off, w)| (addr + off, w))
-                            .map(move |(a, n)| (a, n, (version.clone(), *la57, sig)))
-                            .filter(|(_, w, (_, _, sig))| sig == &w)
-                    })
+                read_data.iter().flat_map(move |CTup2(addr, buf)| {
+                    buf.windows(sig_len)
+                        .enumerate()
+                        .map(move |(off, w)| (*addr + off, w))
+                        .map(move |(a, n)| (a, n, (version.clone(), *la57, sig)))
+                        .filter(|(_, w, (_, _, sig))| sig == &w)
+                })
             })
         {
             let (cr3_off, la57_reloff, phys_base_reloff) = if config_la57 {
@@ -725,15 +829,16 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
 
             let cr3_off = read_val_at(num, cr3_off) as usize;
             let la57 = if let Some(la57_reloff) = la57_reloff {
-                read_val_relat(&mut mem, num, la57_reloff, addr + 8).unwrap_or(0) & 1
+                read_val_relat(&mut mem.phys_view(), num, la57_reloff, addr + 8).unwrap_or(0) & 1
             } else {
                 0
             };
-            let phys_base = read_val_relat(&mut mem, num, phys_base_reloff, addr + 4).unwrap_or(0);
+            let phys_base =
+                read_val_relat(&mut mem.phys_view(), num, phys_base_reloff, addr + 4).unwrap_or(0);
             let cr3 = phys_base + cr3_off as u64;
-            let text_base = addr.as_page_aligned(size::mb(2));
+            let text_base = addr.as_page_aligned(size::mb(2)); // TODO: as_page_aligned should use mem?
 
-            if cr3 != phys_base && cr3 < metadata.size as u64 {
+            if cr3 != phys_base && cr3 < metadata.max_address.to_umem() as u64 {
                 info!("Version range: {}", version);
 
                 info!("phys_base: {:x}", phys_base);
@@ -752,6 +857,7 @@ pub fn find_kernel(mut mem: impl PhysicalMemory) -> Result<KernelInfo> {
                     phys_text: text_base,
                     virt_text,
                     kallsyms,
+                    version,
                 });
             }
         }

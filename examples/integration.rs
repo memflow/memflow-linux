@@ -6,16 +6,20 @@ use clap::*;
 use log::Level;
 
 fn main() -> Result<()> {
-    let (conn, args, level, print_kallsyms) = parse_args()?;
+    let matches = parse_args();
+    let (chain, log_level, print_kallsyms) = extract_args(&matches)?;
 
-    simple_logger::SimpleLogger::new()
-        .with_level(level.to_level_filter())
-        .init()
-        .unwrap();
+    simplelog::TermLogger::init(
+        log_level.to_level_filter(),
+        simplelog::Config::default(),
+        simplelog::TerminalMode::Stdout,
+        simplelog::ColorChoice::Auto,
+    )
+    .unwrap();
 
     let inventory = Inventory::scan();
 
-    let mut connector = inventory.create_connector(&conn, None, &args)?;
+    let mut connector = inventory.builder().connector_chain(chain).build()?;
 
     let KernelInfo {
         cr3,
@@ -24,11 +28,13 @@ fn main() -> Result<()> {
         ..
     } = find_kernel(connector.forward_mut())?;
 
-    let connector = CachedMemoryAccess::builder(connector)
+    let connector = CachedPhysicalMemory::builder(connector)
         .arch(x64::ARCH)
         .build()?;
 
     println!("Kernel virt text: {:x}", virt_text);
+
+    println!("Kernel cr3: {:x}", cr3);
 
     let x64_translator = x64::new_translator(cr3);
 
@@ -46,7 +52,7 @@ fn main() -> Result<()> {
         let time = std::time::Instant::now();
 
         for (addr, name) in kallsyms.syms_iter(&mut mem) {
-            println!("{:016x} {}", addr.as_u64(), name);
+            println!("{:016x} {}", addr.to_umem(), name);
         }
 
         println!("Elapsed: {}", time.elapsed().as_secs_f32());
@@ -55,36 +61,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_args() -> Result<(String, Args, log::Level, bool)> {
-    let matches = App::new("linux integration example")
+fn parse_args() -> ArgMatches {
+    Command::new("linux integration example")
         .version(crate_version!())
         .author(crate_authors!())
-        .arg(Arg::with_name("verbose").short("v").multiple(true))
+        .arg(Arg::new("verbose").short('v').action(ArgAction::Count))
         .arg(
-            Arg::with_name("connector")
+            Arg::new("connector")
                 .long("connector")
-                .short("c")
-                .takes_value(true)
-                .default_value("kcore")
+                .short('c')
+                .action(ArgAction::Append)
+                .required(true),
+        )
+        .arg(
+            Arg::new("os")
+                .long("os")
+                .short('o')
+                .action(ArgAction::Append)
                 .required(false),
         )
         .arg(
-            Arg::with_name("conn-args")
-                .long("conn-args")
-                .short("x")
-                .takes_value(true)
-                .default_value(""),
-        )
-        .arg(
-            Arg::with_name("kallsyms")
+            Arg::new("kallsyms")
                 .long("kallsyms")
-                .short("k")
+                .short('k')
+                .action(ArgAction::Count)
                 .required(false),
         )
-        .get_matches();
+        .get_matches()
+}
 
+fn extract_args(matches: &ArgMatches) -> Result<(ConnectorChain<'_>, log::Level, bool)> {
     // set log level
-    let level = match matches.occurrences_of("verbose") {
+    let level = match matches.get_count("verbose") {
         0 => Level::Error,
         1 => Level::Warn,
         2 => Level::Info,
@@ -93,13 +101,25 @@ fn parse_args() -> Result<(String, Args, log::Level, bool)> {
         _ => Level::Trace,
     };
 
+    let conn_iter = matches
+        .indices_of("connector")
+        .zip(matches.get_many::<String>("connector"))
+        .map(|(a, b)| a.zip(b.map(String::as_str)))
+        .into_iter()
+        .flatten();
+
+    let os_iter = matches
+        .indices_of("os")
+        .zip(matches.get_many::<String>("os"))
+        .map(|(a, b)| a.zip(b.map(String::as_str)))
+        .into_iter()
+        .flatten();
+
+    let print_kallsyms = matches.get_count("kallsyms") > 0;
+
     Ok((
-        matches.value_of("connector").unwrap_or("").into(),
-        Args::parse(matches.value_of("conn-args").ok_or_else(|| {
-            Error(ErrorOrigin::Other, ErrorKind::Configuration)
-                .log_error("failed to parse connector args")
-        })?)?,
+        ConnectorChain::new(conn_iter, os_iter)?,
         level,
-        matches.occurrences_of("kallsyms") > 0,
+        print_kallsyms,
     ))
 }

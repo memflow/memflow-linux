@@ -29,13 +29,13 @@ impl KallsymsInfo {
         token_table: Address,
         token_index: Address,
         alignment: usize,
-        mem: &mut impl VirtualMemory,
+        mem: &mut impl MemoryView,
     ) -> Result<Self> {
         // Walk down from the names
-        let num_syms_addr = (names - 4).as_page_aligned(alignment);
-        let num_syms = mem.virt_read::<i32>(num_syms_addr)? as usize;
-        let relative_base_addr = (num_syms_addr - 8).as_page_aligned(alignment);
-        let relative_base = mem.virt_read::<u64>(relative_base_addr)?.into();
+        let num_syms_addr = (names - 4 as umem).as_page_aligned(alignment);
+        let num_syms = mem.read::<i32>(num_syms_addr)? as usize;
+        let relative_base_addr = (num_syms_addr - 8 as umem).as_page_aligned(alignment);
+        let relative_base = mem.read::<u64>(relative_base_addr)?.into();
         let offsets = (relative_base_addr - num_syms * 4).as_page_aligned(alignment);
 
         // TODO: fallback walk names, if token_index is null, and token_table
@@ -65,18 +65,18 @@ impl KallsymsInfo {
 
     pub fn expand_symbol(
         &self,
-        mem: &mut impl VirtualMemory,
+        mem: &mut impl MemoryView,
         offset: usize,
         name: &mut String,
     ) -> Result<usize> {
         name.clear();
 
-        let len = mem.virt_read::<u8>(self.names + offset)?;
+        let len = mem.read::<u8>(self.names + offset)?;
 
         for i in 1..=len {
-            let byte = mem.virt_read::<u8>(self.names + offset + i as usize)?;
-            let idx = mem.virt_read::<u16>(self.token_index + byte as usize * 2)?;
-            let s = mem.virt_read_char_string(self.token_table + idx as usize)?;
+            let byte = mem.read::<u8>(self.names + offset + i as usize)?;
+            let idx = mem.read::<u16>(self.token_index + byte as usize * 2)?;
+            let s = mem.read_char_string(self.token_table + idx as usize)?;
 
             name.extend(s.chars().skip(if i == 1 { 1 } else { 0 }));
         }
@@ -86,8 +86,8 @@ impl KallsymsInfo {
 
     // This function is used when both CONFIG_KALLSYMS_BASE_RELATIVE and
     // CONFIG_KALLSYMS_ABSOLUTE_PERCPU are set.
-    pub fn sym_address(&self, mem: &mut impl VirtualMemory, idx: usize) -> Result<Address> {
-        let offset = mem.virt_read::<i32>(self.offsets + idx * 4)?;
+    pub fn sym_address(&self, mem: &mut impl MemoryView, idx: usize) -> Result<Address> {
+        let offset = mem.read::<i32>(self.offsets + idx * 4)?;
 
         if offset < 0 {
             Ok(self.relative_base - 1 + (-offset) as usize)
@@ -96,11 +96,11 @@ impl KallsymsInfo {
         }
     }
 
-    pub fn syms_iter<'a, T: VirtualMemory>(&'a self, mem: &'a mut T) -> KallsymsIterator<'a, T> {
+    pub fn syms_iter<'a, T: MemoryView>(&'a self, mem: &'a mut T) -> KallsymsIterator<'a, T> {
         KallsymsIterator::new(self, mem)
     }
 
-    /*pub fn lookup_name(&self, sym: &str, mem: &mut impl VirtualMemory) -> Result<Address> {
+    /*pub fn lookup_name(&self, sym: &str, mem: &mut impl MemoryView) -> Result<Address> {
         Ok(Address::NULL)
     }*/
 }
@@ -112,7 +112,7 @@ pub struct KallsymsIterator<'a, T> {
     cur_name_off: usize,
 }
 
-impl<'a, T: VirtualMemory> KallsymsIterator<'a, T> {
+impl<'a, T: MemoryView> KallsymsIterator<'a, T> {
     pub fn new(kallsyms: &'a KallsymsInfo, mem: &'a mut T) -> Self {
         Self {
             kallsyms,
@@ -142,7 +142,7 @@ impl<'a, T: VirtualMemory> KallsymsIterator<'a, T> {
     }
 }
 
-impl<'a, T: VirtualMemory> Iterator for KallsymsIterator<'a, T> {
+impl<'a, T: MemoryView> Iterator for KallsymsIterator<'a, T> {
     type Item = (Address, String);
 
     fn next(&mut self) -> Option<Self::Item> {
